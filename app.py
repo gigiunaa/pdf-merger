@@ -5,10 +5,12 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.units import inch
+from PIL import Image
 from io import BytesIO
 import os
 import tempfile
 import logging
+import ast
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -50,6 +52,24 @@ def find_candidate_by_email(access_token, email):
     return data[0]["id"] if data else None
 
 
+def extract_url(val):
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return val[0] if val else None
+    if isinstance(val, str):
+        s = val.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, list) and parsed:
+                    return parsed[0]
+            except:
+                pass
+        return s
+    return None
+
+
 def generate_onboarding_pdf(form_data):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.7*inch, bottomMargin=0.7*inch)
@@ -82,14 +102,46 @@ def generate_onboarding_pdf(form_data):
     return buffer
 
 
-def download_pdf(url, headers=None):
+def download_file_as_pdf(url, headers=None):
     r = requests.get(url, headers=headers, stream=True, timeout=60)
     r.raise_for_status()
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+    content_type = r.headers.get('Content-Type', '').lower()
+    url_lower = url.lower().split('?')[0]
+    
+    temp_raw = tempfile.NamedTemporaryFile(delete=False)
     for chunk in r.iter_content(chunk_size=8192):
-        temp.write(chunk)
-    temp.close()
-    return temp.name
+        temp_raw.write(chunk)
+    temp_raw.close()
+    
+    is_pdf = 'pdf' in content_type or url_lower.endswith('.pdf')
+    
+    if is_pdf:
+        logger.info(f"File is PDF: {url[:100]}")
+        return temp_raw.name
+    
+    is_image = (
+        any(ext in content_type for ext in ['image/', 'png', 'jpeg', 'jpg', 'webp'])
+        or any(url_lower.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.webp', '.gif'])
+    )
+    
+    if is_image:
+        logger.info(f"Converting image to PDF: {url[:100]}")
+        img = Image.open(temp_raw.name)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            img = img.convert('RGB')
+        pdf_path = temp_raw.name + '.pdf'
+        img.save(pdf_path, 'PDF', resolution=100.0)
+        try:
+            os.unlink(temp_raw.name)
+        except:
+            pass
+        return pdf_path
+    
+    try:
+        os.unlink(temp_raw.name)
+    except:
+        pass
+    raise ValueError(f"Unsupported file type. Content-Type: {content_type}, URL: {url[:100]}")
 
 
 def merge_pdfs(pdf_files):
@@ -130,13 +182,17 @@ def home():
 
 @app.route('/process-onboarding', methods=['POST'])
 def process_onboarding():
+    temp_files = []
     try:
         data = request.get_json()
         logger.info(f"Received request for: {data.get('email')}")
         
         email = data.get('email')
-        id_file_url = data.get('id_file_url')
-        bank_file_url = data.get('bank_file_url')
+        id_file_url = extract_url(data.get('id_file_url'))
+        bank_file_url = extract_url(data.get('bank_file_url'))
+        
+        logger.info(f"ID URL: {id_file_url[:100] if id_file_url else 'None'}")
+        logger.info(f"Bank URL: {bank_file_url[:100] if bank_file_url else 'None'}")
         
         if not email:
             return jsonify({"error": "email is required"}), 400
@@ -155,16 +211,16 @@ def process_onboarding():
         temp_onboarding.close()
         
         pdfs_to_merge = [temp_onboarding.name]
-        temp_files = [temp_onboarding.name]
+        temp_files.append(temp_onboarding.name)
         
         if id_file_url:
-            id_pdf = download_pdf(id_file_url)
+            id_pdf = download_file_as_pdf(id_file_url)
             pdfs_to_merge.append(id_pdf)
             temp_files.append(id_pdf)
             logger.info("Downloaded ID file")
         
         if bank_file_url:
-            bank_pdf = download_pdf(bank_file_url)
+            bank_pdf = download_file_as_pdf(bank_file_url)
             pdfs_to_merge.append(bank_pdf)
             temp_files.append(bank_pdf)
             logger.info("Downloaded Bank file")
@@ -184,12 +240,6 @@ def process_onboarding():
         attach_result = attach_to_candidate(access_token, candidate_id, merged_bytes, filename)
         logger.info("Attached to candidate")
         
-        for tf in temp_files:
-            try:
-                os.unlink(tf)
-            except:
-                pass
-        
         return jsonify({
             "status": "success",
             "candidate_id": candidate_id,
@@ -204,6 +254,12 @@ def process_onboarding():
     except Exception as e:
         logger.error(f"Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        for tf in temp_files:
+            try:
+                os.unlink(tf)
+            except:
+                pass
 
 
 if __name__ == '__main__':
