@@ -44,7 +44,9 @@ def find_candidate_by_email(access_token, email):
     url = f"{RECRUIT_BASE}/Candidates/search"
     headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
     params = {"criteria": f"(Email:equals:{email})"}
+    logger.info(f"Searching candidate: {email}")
     r = requests.get(url, headers=headers, params=params, timeout=30)
+    logger.info(f"Search status: {r.status_code}")
     if r.status_code == 204:
         return None
     r.raise_for_status()
@@ -102,9 +104,16 @@ def generate_onboarding_pdf(form_data):
     return buffer
 
 
-def download_file_as_pdf(url, headers=None):
-    r = requests.get(url, headers=headers, stream=True, timeout=60)
+def download_file_as_pdf(url, access_token=None):
+    headers = {}
+    if access_token:
+        headers["Authorization"] = f"Zoho-oauthtoken {access_token}"
+    
+    logger.info(f"Downloading: {url[:100]}")
+    r = requests.get(url, headers=headers, stream=True, timeout=60, allow_redirects=True)
+    logger.info(f"Download status: {r.status_code}, Content-Type: {r.headers.get('Content-Type')}")
     r.raise_for_status()
+    
     content_type = r.headers.get('Content-Type', '').lower()
     url_lower = url.lower().split('?')[0]
     
@@ -113,10 +122,11 @@ def download_file_as_pdf(url, headers=None):
         temp_raw.write(chunk)
     temp_raw.close()
     
-    is_pdf = 'pdf' in content_type or url_lower.endswith('.pdf')
+    file_size = os.path.getsize(temp_raw.name)
+    logger.info(f"Downloaded file size: {file_size} bytes")
     
+    is_pdf = 'pdf' in content_type or url_lower.endswith('.pdf')
     if is_pdf:
-        logger.info(f"File is PDF: {url[:100]}")
         return temp_raw.name
     
     is_image = (
@@ -125,23 +135,49 @@ def download_file_as_pdf(url, headers=None):
     )
     
     if is_image:
-        logger.info(f"Converting image to PDF: {url[:100]}")
-        img = Image.open(temp_raw.name)
-        if img.mode in ('RGBA', 'LA', 'P'):
-            img = img.convert('RGB')
-        pdf_path = temp_raw.name + '.pdf'
-        img.save(pdf_path, 'PDF', resolution=100.0)
+        logger.info("Converting image to PDF")
         try:
-            os.unlink(temp_raw.name)
-        except:
-            pass
-        return pdf_path
+            img = Image.open(temp_raw.name)
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGB')
+            pdf_path = temp_raw.name + '.pdf'
+            img.save(pdf_path, 'PDF', resolution=100.0)
+            try:
+                os.unlink(temp_raw.name)
+            except:
+                pass
+            return pdf_path
+        except Exception as e:
+            logger.error(f"Image conversion failed: {e}")
+            raise
+    
+    try:
+        with open(temp_raw.name, 'rb') as f:
+            header = f.read(4)
+        logger.info(f"File header bytes: {header}")
+        if header.startswith(b'%PDF'):
+            logger.info("Detected PDF by magic bytes")
+            return temp_raw.name
+        if header[:2] in (b'\xff\xd8', b'\x89P') or header[:3] == b'GIF':
+            logger.info("Detected image by magic bytes, converting")
+            img = Image.open(temp_raw.name)
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGB')
+            pdf_path = temp_raw.name + '.pdf'
+            img.save(pdf_path, 'PDF', resolution=100.0)
+            try:
+                os.unlink(temp_raw.name)
+            except:
+                pass
+            return pdf_path
+    except Exception as e:
+        logger.error(f"Magic byte detection failed: {e}")
     
     try:
         os.unlink(temp_raw.name)
     except:
         pass
-    raise ValueError(f"Unsupported file type. Content-Type: {content_type}, URL: {url[:100]}")
+    raise ValueError(f"Unsupported file type. Content-Type: {content_type}")
 
 
 def merge_pdfs(pdf_files):
@@ -161,6 +197,7 @@ def upload_to_workdrive(access_token, pdf_bytes, filename):
     files = {"content": (filename, pdf_bytes, "application/pdf")}
     data = {"parent_id": WORKDRIVE_FOLDER_ID, "filename": filename, "override-name-exist": "true"}
     r = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+    logger.info(f"WorkDrive upload status: {r.status_code}")
     r.raise_for_status()
     return r.json()
 
@@ -171,6 +208,7 @@ def attach_to_candidate(access_token, candidate_id, pdf_bytes, filename):
     files = {"file": (filename, pdf_bytes, "application/pdf")}
     params = {"attachments_category": "Others"}
     r = requests.post(url, headers=headers, files=files, params=params, timeout=60)
+    logger.info(f"Recruit attach status: {r.status_code}")
     r.raise_for_status()
     return r.json()
 
@@ -191,8 +229,8 @@ def process_onboarding():
         id_file_url = extract_url(data.get('id_file_url'))
         bank_file_url = extract_url(data.get('bank_file_url'))
         
-        logger.info(f"ID URL: {id_file_url[:100] if id_file_url else 'None'}")
-        logger.info(f"Bank URL: {bank_file_url[:100] if bank_file_url else 'None'}")
+        logger.info(f"ID URL: {id_file_url[:120] if id_file_url else 'None'}")
+        logger.info(f"Bank URL: {bank_file_url[:120] if bank_file_url else 'None'}")
         
         if not email:
             return jsonify({"error": "email is required"}), 400
@@ -202,6 +240,7 @@ def process_onboarding():
         
         candidate_id = find_candidate_by_email(access_token, email)
         if not candidate_id:
+            logger.warning(f"Candidate not found: {email}")
             return jsonify({"error": f"Candidate not found: {email}"}), 404
         logger.info(f"Found candidate: {candidate_id}")
         
@@ -209,24 +248,31 @@ def process_onboarding():
         temp_onboarding = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
         temp_onboarding.write(onboarding_pdf.getvalue())
         temp_onboarding.close()
+        logger.info("Generated onboarding PDF")
         
         pdfs_to_merge = [temp_onboarding.name]
         temp_files.append(temp_onboarding.name)
         
         if id_file_url:
-            id_pdf = download_file_as_pdf(id_file_url)
-            pdfs_to_merge.append(id_pdf)
-            temp_files.append(id_pdf)
-            logger.info("Downloaded ID file")
+            try:
+                id_pdf = download_file_as_pdf(id_file_url, access_token=access_token)
+                pdfs_to_merge.append(id_pdf)
+                temp_files.append(id_pdf)
+                logger.info("Added ID file to merge list")
+            except Exception as e:
+                logger.error(f"ID download failed: {e}")
         
         if bank_file_url:
-            bank_pdf = download_file_as_pdf(bank_file_url)
-            pdfs_to_merge.append(bank_pdf)
-            temp_files.append(bank_pdf)
-            logger.info("Downloaded Bank file")
+            try:
+                bank_pdf = download_file_as_pdf(bank_file_url, access_token=access_token)
+                pdfs_to_merge.append(bank_pdf)
+                temp_files.append(bank_pdf)
+                logger.info("Added Bank file to merge list")
+            except Exception as e:
+                logger.error(f"Bank download failed: {e}")
         
         merged = merge_pdfs(pdfs_to_merge)
-        logger.info("PDFs merged")
+        logger.info(f"PDFs merged: {len(pdfs_to_merge)} files")
         
         first = data.get('first_name', '')
         last = data.get('last_name', '')
@@ -244,6 +290,7 @@ def process_onboarding():
             "status": "success",
             "candidate_id": candidate_id,
             "filename": filename,
+            "files_merged": len(pdfs_to_merge),
             "workdrive": "uploaded",
             "recruit_attachment": "uploaded"
         })
@@ -252,7 +299,7 @@ def process_onboarding():
         logger.error(f"HTTP error: {e.response.text if e.response else str(e)}")
         return jsonify({"error": str(e), "details": e.response.text if e.response else None}), 500
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
+        logger.error(f"Error: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
     finally:
         for tf in temp_files:
