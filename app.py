@@ -122,10 +122,8 @@ def download_file_as_pdf(url, access_token=None):
         temp_raw.write(chunk)
     temp_raw.close()
     
-    file_size = os.path.getsize(temp_raw.name)
-    logger.info(f"Downloaded file size: {file_size} bytes")
-    
     is_pdf = 'pdf' in content_type or url_lower.endswith('.pdf')
+    
     if is_pdf:
         return temp_raw.name
     
@@ -136,30 +134,24 @@ def download_file_as_pdf(url, access_token=None):
     
     if is_image:
         logger.info("Converting image to PDF")
+        img = Image.open(temp_raw.name)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            img = img.convert('RGB')
+        pdf_path = temp_raw.name + '.pdf'
+        img.save(pdf_path, 'PDF', resolution=100.0)
         try:
-            img = Image.open(temp_raw.name)
-            if img.mode in ('RGBA', 'LA', 'P'):
-                img = img.convert('RGB')
-            pdf_path = temp_raw.name + '.pdf'
-            img.save(pdf_path, 'PDF', resolution=100.0)
-            try:
-                os.unlink(temp_raw.name)
-            except:
-                pass
-            return pdf_path
-        except Exception as e:
-            logger.error(f"Image conversion failed: {e}")
-            raise
+            os.unlink(temp_raw.name)
+        except:
+            pass
+        return pdf_path
     
     try:
         with open(temp_raw.name, 'rb') as f:
             header = f.read(4)
         logger.info(f"File header bytes: {header}")
         if header.startswith(b'%PDF'):
-            logger.info("Detected PDF by magic bytes")
             return temp_raw.name
         if header[:2] in (b'\xff\xd8', b'\x89P') or header[:3] == b'GIF':
-            logger.info("Detected image by magic bytes, converting")
             img = Image.open(temp_raw.name)
             if img.mode in ('RGBA', 'LA', 'P'):
                 img = img.convert('RGB')
@@ -191,13 +183,45 @@ def merge_pdfs(pdf_files):
     return output
 
 
-def upload_to_workdrive(access_token, pdf_bytes, filename):
+def read_file_bytes(path):
+    with open(path, 'rb') as f:
+        return f.read()
+
+
+def create_workdrive_folder(access_token, parent_id, folder_name):
+    url = f"{WORKDRIVE_BASE}/files"
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {access_token}",
+        "Content-Type": "application/vnd.api+json",
+        "Accept": "application/vnd.api+json"
+    }
+    payload = {
+        "data": {
+            "attributes": {
+                "name": folder_name,
+                "parent_id": parent_id
+            },
+            "type": "files"
+        }
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    logger.info(f"Create folder status: {r.status_code}")
+    if r.status_code in (200, 201):
+        data = r.json().get("data", {})
+        folder_id = data.get("id")
+        logger.info(f"Folder created: {folder_id}")
+        return folder_id
+    logger.error(f"Create folder failed: {r.text}")
+    r.raise_for_status()
+
+
+def upload_to_workdrive(access_token, pdf_bytes, filename, parent_folder_id):
     url = f"{WORKDRIVE_BASE}/upload"
     headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
     files = {"content": (filename, pdf_bytes, "application/pdf")}
-    data = {"parent_id": WORKDRIVE_FOLDER_ID, "filename": filename, "override-name-exist": "true"}
+    data = {"parent_id": parent_folder_id, "filename": filename, "override-name-exist": "true"}
     r = requests.post(url, headers=headers, files=files, data=data, timeout=60)
-    logger.info(f"WorkDrive upload status: {r.status_code}")
+    logger.info(f"WorkDrive upload '{filename}' status: {r.status_code}")
     r.raise_for_status()
     return r.json()
 
@@ -208,7 +232,7 @@ def attach_to_candidate(access_token, candidate_id, pdf_bytes, filename):
     files = {"file": (filename, pdf_bytes, "application/pdf")}
     params = {"attachments_category": "Others"}
     r = requests.post(url, headers=headers, files=files, params=params, timeout=60)
-    logger.info(f"Recruit attach status: {r.status_code}")
+    logger.info(f"Recruit attach '{filename}' status: {r.status_code}")
     r.raise_for_status()
     return r.json()
 
@@ -229,8 +253,9 @@ def process_onboarding():
         id_file_url = extract_url(data.get('id_file_url'))
         bank_file_url = extract_url(data.get('bank_file_url'))
         
-        logger.info(f"ID URL: {id_file_url[:120] if id_file_url else 'None'}")
-        logger.info(f"Bank URL: {bank_file_url[:120] if bank_file_url else 'None'}")
+        first = data.get('first_name', '').strip()
+        last = data.get('last_name', '').strip()
+        full_name = f"{first} {last}".strip()
         
         if not email:
             return jsonify({"error": "email is required"}), 400
@@ -240,59 +265,75 @@ def process_onboarding():
         
         candidate_id = find_candidate_by_email(access_token, email)
         if not candidate_id:
-            logger.warning(f"Candidate not found: {email}")
             return jsonify({"error": f"Candidate not found: {email}"}), 404
         logger.info(f"Found candidate: {candidate_id}")
         
+        # Generate onboarding summary PDF
         onboarding_pdf = generate_onboarding_pdf(data)
         temp_onboarding = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
         temp_onboarding.write(onboarding_pdf.getvalue())
         temp_onboarding.close()
+        temp_files.append(temp_onboarding.name)
         logger.info("Generated onboarding PDF")
         
-        pdfs_to_merge = [temp_onboarding.name]
-        temp_files.append(temp_onboarding.name)
+        # Download ID and Bank files
+        id_pdf_path = None
+        bank_pdf_path = None
         
         if id_file_url:
-            try:
-                id_pdf = download_file_as_pdf(id_file_url, access_token=access_token)
-                pdfs_to_merge.append(id_pdf)
-                temp_files.append(id_pdf)
-                logger.info("Added ID file to merge list")
-            except Exception as e:
-                logger.error(f"ID download failed: {e}")
+            id_pdf_path = download_file_as_pdf(id_file_url, access_token=access_token)
+            temp_files.append(id_pdf_path)
+            logger.info("Downloaded ID file")
         
         if bank_file_url:
-            try:
-                bank_pdf = download_file_as_pdf(bank_file_url, access_token=access_token)
-                pdfs_to_merge.append(bank_pdf)
-                temp_files.append(bank_pdf)
-                logger.info("Added Bank file to merge list")
-            except Exception as e:
-                logger.error(f"Bank download failed: {e}")
+            bank_pdf_path = download_file_as_pdf(bank_file_url, access_token=access_token)
+            temp_files.append(bank_pdf_path)
+            logger.info("Downloaded Bank file")
         
-        merged = merge_pdfs(pdfs_to_merge)
-        logger.info(f"PDFs merged: {len(pdfs_to_merge)} files")
+        # Create merged PDF (Summary + ID + Bank)
+        pdfs_to_merge = [temp_onboarding.name]
+        if id_pdf_path:
+            pdfs_to_merge.append(id_pdf_path)
+        if bank_pdf_path:
+            pdfs_to_merge.append(bank_pdf_path)
         
-        first = data.get('first_name', '')
-        last = data.get('last_name', '')
-        filename = f"Onboarding - {first} {last}.pdf"
+        merged_pdf = merge_pdfs(pdfs_to_merge)
+        merged_bytes = merged_pdf.getvalue()
+        logger.info(f"Merged {len(pdfs_to_merge)} PDFs")
         
-        merged_bytes = merged.getvalue()
+        # Prepare individual files
+        full_filename = f"Onboarding - {full_name}.pdf"
+        id_filename = f"ID - {full_name}.pdf"
+        bank_filename = f"Bank Requisites - {full_name}.pdf"
         
-        wd_result = upload_to_workdrive(access_token, merged_bytes, filename)
-        logger.info("Uploaded to WorkDrive")
+        id_bytes = read_file_bytes(id_pdf_path) if id_pdf_path else None
+        bank_bytes = read_file_bytes(bank_pdf_path) if bank_pdf_path else None
         
-        attach_result = attach_to_candidate(access_token, candidate_id, merged_bytes, filename)
-        logger.info("Attached to candidate")
+        # Create candidate folder in WorkDrive
+        candidate_folder_id = create_workdrive_folder(access_token, WORKDRIVE_FOLDER_ID, full_name)
+        logger.info(f"Created WorkDrive folder: {candidate_folder_id}")
+        
+        # Upload 3 files to WorkDrive candidate folder
+        upload_to_workdrive(access_token, merged_bytes, full_filename, candidate_folder_id)
+        if id_bytes:
+            upload_to_workdrive(access_token, id_bytes, id_filename, candidate_folder_id)
+        if bank_bytes:
+            upload_to_workdrive(access_token, bank_bytes, bank_filename, candidate_folder_id)
+        logger.info("Uploaded 3 files to WorkDrive")
+        
+        # Attach 3 files to Recruit candidate
+        attach_to_candidate(access_token, candidate_id, merged_bytes, full_filename)
+        if id_bytes:
+            attach_to_candidate(access_token, candidate_id, id_bytes, id_filename)
+        if bank_bytes:
+            attach_to_candidate(access_token, candidate_id, bank_bytes, bank_filename)
+        logger.info("Attached 3 files to candidate")
         
         return jsonify({
             "status": "success",
             "candidate_id": candidate_id,
-            "filename": filename,
-            "files_merged": len(pdfs_to_merge),
-            "workdrive": "uploaded",
-            "recruit_attachment": "uploaded"
+            "workdrive_folder_id": candidate_folder_id,
+            "files": [full_filename, id_filename, bank_filename]
         })
     
     except requests.exceptions.HTTPError as e:
