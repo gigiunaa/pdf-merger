@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "gunicorn app:app",
+    "startCommand": "gunicorn app:app --timeout 300",
     "restartPolicyType": "ON_FAILURE"
   }
 }
